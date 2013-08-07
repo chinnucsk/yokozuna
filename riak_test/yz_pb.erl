@@ -2,7 +2,9 @@
 -module(yz_pb).
 -compile(export_all).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("riak_pb/include/riak_kv_pb.hrl").
 -include_lib("riak_pb/include/riak_yokozuna_pb.hrl").
+-include("yokozuna.hrl").
 
 -define(FMT(S, Args), lists:flatten(io_lib:format(S, Args))).
 -define(NO_HEADERS, []).
@@ -15,12 +17,10 @@ confirm() ->
     random:seed(now()),
     Cluster = prepare_cluster(4),
 
-    Bucket = <<"basic">>,
-    create_index(Cluster, Bucket),
-
-    % confirm_basic_search(Cluster),
-    % confirm_encoded_search(Cluster),
-    % confirm_multivalued_field(Cluster),
+    create_index(Cluster),
+    confirm_basic_search(Cluster),
+    confirm_encoded_search(Cluster),
+    confirm_multivalued_field(Cluster),
     pass.
 
 
@@ -63,48 +63,44 @@ http(Method, URL, Headers, Body) ->
     Opts = [],
     ibrowse:send_req(URL, Headers, Method, Body, Opts).
 
-create_index(Cluster, Index) ->
+create_index(Cluster) ->
+    Index = <<"basic">>,
     HP = select_random(host_entries(rt:connection_info(Cluster))),
     lager:info("create_index ~s [~p]", [Index, HP]),
-
     {Host, Port} = HP,
     {ok, Pid} = riakc_pb_socket:start_link(Host, (Port-1)),
     F = fun(_) ->
-                %% set index in props with the same name as the bucket
-                % riakc_pb_socket:set_bucket(Pid, Index, [{yz_index, Index}]),
-                lager:info("Set index on bucket ~p [~p]", [Index, HP]),
-                % riakc_pb_socket
-                Idx = #rpbyokozunaindex{name = Index},
-                Req = #rpbyokozunaindexputreq{index = Idx},
-                X = gen_server:call(Pid,
-                    {req, Req, infinity},
-                    infinity),
-                % riakc_pb_socket:default_timeout(ping_timeout)
-                % riakc_pb_socket:send_request(),
-                lager:info("Message ~p~n", [X]),
-                true
-                % riakc_pb_socket:search(Pid, Bucket, Search, Params),
-                % {ok,{search_results,R,Score,Found}} =
-                %     riakc_pb_socket:search(Pid, Bucket, Search, Params),
-                % case Found of
-                %     1 ->
-                %         [{Bucket,Results}] = R,
-                %         KeyCheck = (Key == binary_to_list(proplists:get_value(<<"_yz_rk">>, Results))),
-                %         ScoreCheck = (Score =/= 0.0),
-                %         KeyCheck and ScoreCheck;
-                %     0 ->
-                %         false
-                % end
+            %% set index in props with the same name as the bucket
+            Idx     = #rpbyokozunaindex{name = Index},
+            PutReq  = #rpbyokozunaindexputreq{index = Idx},
+            PutResp = gen_server:call(Pid, {req, PutReq, infinity}, infinity),
+            %% There is currently no admin driver impl in the erlang client
+            %% so capture the process_response error and check the reply
+            {error,{unknown_response,_,PutRespMsg}} = PutResp,
+            ?assertEqual(rpbputresp, PutRespMsg),
+
+            yz_rt:wait_for_index(Cluster, "basic"),
+
+            %% Check that the index exists
+            GetReq  = #rpbyokozunaindexgetreq{name = Index},
+            GetResp = gen_server:call(Pid, {req, GetReq, infinity}, infinity),
+            {error,{unknown_response,_,GetRespMsg}} = GetResp,
+
+            {rpbyokozunaindexgetresp,GestRespIndexes} = GetRespMsg,
+            [{rpbyokozunaindex,Index,Schema}] = GestRespIndexes,
+
+            ?assertEqual(?YZ_DEFAULT_SCHEMA_NAME, Schema),
+
+            true
         end,
     yz_rt:wait_until(Cluster, F),
-    ok.
 
-    % URL = index_url(HP, Index),
-    % Headers = [{"content-type", "application/json"}],
-    % {ok, Status, _, _} = http(put, URL, Headers, ?NO_BODY),
-    % yz_rt:set_index(hd(Cluster), Index),
-    % timer:sleep(5000),
-    % ?assertEqual("204", Status).
+    %% Delete the bucket
+    DelReq  = #rpbyokozunaindexdeletereq{name = Index},
+    DelResp = gen_server:call(Pid, {req, DelReq, infinity}, infinity),
+    {error,{unknown_response,_,DelRespMsg}} = DelResp,
+    ?assertEqual(rpbdelresp, DelRespMsg),
+    ok.
 
 store_and_search(Cluster, Bucket, Key, Body, Search, Params) ->
     store_and_search(Cluster, Bucket, Key, Body, "text/plain", Search, Params).
